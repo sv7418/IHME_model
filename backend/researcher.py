@@ -12,6 +12,7 @@ from typing import AsyncGenerator, Any
 
 import anthropic
 from openai import AsyncOpenAI
+from groq import AsyncGroq
 
 from backend.pubmed import fetch_disease_context
 from backend.clinicaltrials import fetch_trials
@@ -324,12 +325,15 @@ async def _stream_anthropic(
     yield {"type": "done"}
 
 
-async def _stream_ollama(
+async def _stream_openai_compatible(
     user_message: str,
     base_url: str,
+    api_key: str,
     model: str,
+    label: str = "provider",
 ) -> AsyncGenerator[dict[str, Any], None]:
-    client = AsyncOpenAI(base_url=base_url, api_key="ollama")
+    """Shared streaming helper for any OpenAI-compatible endpoint (Ollama, Groq, etc.)."""
+    client = AsyncOpenAI(base_url=base_url, api_key=api_key)
     try:
         stream = await client.chat.completions.create(
             model=model,
@@ -348,11 +352,44 @@ async def _stream_ollama(
         msg = str(e)
         if "Connection refused" in msg or "ConnectError" in msg:
             yield {"type": "error", "message": (
-                f"Cannot reach Ollama at {base_url}. "
-                "Is Ollama running? Start it with: ollama serve"
+                f"Cannot reach {label} at {base_url}. "
+                "Is the server running? (ollama serve)"
             )}
+        elif "401" in msg or "invalid_api_key" in msg.lower() or "authentication" in msg.lower():
+            yield {"type": "error", "message": f"Invalid API key for {label}. Check your .env file."}
         else:
-            yield {"type": "error", "message": f"Ollama error: {msg}"}
+            yield {"type": "error", "message": f"{label} error: {msg}"}
+        return
+    yield {"type": "done"}
+
+
+async def _stream_groq(
+    user_message: str,
+    api_key: str,
+    model: str,
+) -> AsyncGenerator[dict[str, Any], None]:
+    """Groq-native streaming (uses groq SDK directly)."""
+    client = AsyncGroq(api_key=api_key)
+    try:
+        stream = await client.chat.completions.create(
+            model=model,
+            max_tokens=6000,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user",   "content": user_message},
+            ],
+            stream=True,
+        )
+        async for chunk in stream:
+            text = chunk.choices[0].delta.content
+            if text:
+                yield {"type": "content", "text": text}
+    except Exception as e:
+        msg = str(e)
+        if "401" in msg or "invalid_api_key" in msg.lower() or "authentication" in msg.lower():
+            yield {"type": "error", "message": "Invalid GROQ_API_KEY. Check your .env file."}
+        else:
+            yield {"type": "error", "message": f"Groq error: {msg}"}
         return
     yield {"type": "done"}
 
@@ -377,25 +414,39 @@ async def run_research(
             yield event
         return
 
-    # Validate credentials before hitting external data APIs
+    # Validate credentials / config before hitting external data APIs
     if provider == "anthropic":
         api_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
         if not api_key:
             yield {
                 "type": "error",
                 "message": (
-                    "ANTHROPIC_API_KEY is not set. "
-                    "Add it to .env, set LLM_PROVIDER=ollama to use a local model, "
-                    "or set MOCK_MODE=true to test without any key."
+                    "ANTHROPIC_API_KEY is not set. Options: "
+                    "(1) Add key to .env  "
+                    "(2) Set LLM_PROVIDER=groq + GROQ_API_KEY (free at console.groq.com)  "
+                    "(3) Set LLM_PROVIDER=ollama for a local model  "
+                    "(4) Set MOCK_MODE=true to test the UI without any key."
                 ),
             }
             return
+    elif provider == "groq":
+        api_key = os.getenv("GROQ_API_KEY", "").strip()
+        if not api_key:
+            yield {
+                "type": "error",
+                "message": (
+                    "GROQ_API_KEY is not set. "
+                    "Get a free key at https://console.groq.com, then add GROQ_API_KEY=... to your .env file."
+                ),
+            }
+            return
+        groq_model = os.getenv("GROQ_MODEL", "llama-3.1-70b-versatile")
     elif provider == "ollama":
         api_key = None
         ollama_base = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/v1")
         ollama_model = os.getenv("OLLAMA_MODEL", "llama3.1")
     else:
-        yield {"type": "error", "message": f"Unknown LLM_PROVIDER: '{provider}'. Use 'anthropic' or 'ollama'."}
+        yield {"type": "error", "message": f"Unknown LLM_PROVIDER: '{provider}'. Use 'anthropic', 'groq', or 'ollama'."}
         return
 
     # ── Step 1: Gather external data concurrently ──────────────────────────
@@ -433,11 +484,22 @@ async def run_research(
         async for event in _stream_anthropic(user_message, api_key):
             yield event
 
+    elif provider == "groq":
+        yield {
+            "type": "status",
+            "step": "claude",
+            "message": f"Synthesizing analysis with Groq ({groq_model})…",
+        }
+        async for event in _stream_groq(user_message, api_key, groq_model):
+            yield event
+
     elif provider == "ollama":
         yield {
             "type": "status",
             "step": "claude",
             "message": f"Synthesizing analysis with Ollama ({ollama_model})…",
         }
-        async for event in _stream_ollama(user_message, ollama_base, ollama_model):
+        async for event in _stream_openai_compatible(
+            user_message, ollama_base, "ollama", ollama_model, label="Ollama"
+        ):
             yield event
